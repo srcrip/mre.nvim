@@ -22,6 +22,14 @@ Ever wished the changelist worked across all open buffers, and had a persistent 
       max_history_per_file = 10,
       max_history = 100,
       virt_text = "-",
+      -- whether to remove marks only on the same line as another
+      dedupe_line = true,
+      -- whether to remove marks only on the same line and column as another
+      dedupe_column = false,
+      -- print out some useful information when using the plugin
+      verbose = true,
+      -- debug information you probably won't need
+      debug = false,
     })
 
     vim.keymap.set('n', '<tab>', mre.jump_prev, {})

@@ -4,6 +4,34 @@ M.opts = {}
 M.edits = {}
 M.cursor = 1
 
+-- todo: although this does store a copy of row/col in the main table, I think it probably shouldn't. It needs to be
+-- serialized, but when in memory it should probably just look into the extmark for everything.
+
+-- todo: how do you define a lua type spec for this?
+-- each location looks like this:
+-- {
+--   file = file,
+--   bufnr = bufnr,
+--   id = id, -- the extmark id
+--   row = row,
+--   col = col,
+--   virt_text = virt_text
+-- }
+
+function M.debug(msg)
+  M.opts.debug = true
+  if M.opts.debug then
+    vim.notify(vim.inspect(msg))
+  end
+end
+
+function M.log(msg)
+  M.opts.verbose = true
+  if M.opts.verbose then
+    vim.print(msg)
+  end
+end
+
 function M.open_or_edit(file)
   local existing = vim.fn.bufnr(file)
   if existing ~= -1 then
@@ -33,6 +61,7 @@ function M.create_extmark(file, bufnr, row, col, virt_text, id)
     id = id,
     virt_text = { { virt_text, "Function" } },
     virt_text_pos = "right_align",
+    strict = false
   })
 
   local location = { file = file, bufnr = bufnr, id = id, row = row, col = col, virt_text = virt_text }
@@ -87,7 +116,7 @@ function M.track_edit(bufnr)
 
     M.cursor = #M.edits + 1
   else
-    -- print("failed to create extmark")
+    -- M.debug("failed to create extmark")
   end
 
   -- remove entries for this file that are past max_history_per_file or max_history
@@ -114,10 +143,48 @@ function M.track_edit(bufnr)
     table.remove(M.edits, 1)
   end
 
+  -- loop through all locations and delete the ones that point to the same row/col
+  if M.opts.dedupe_line then
+    local seen = {}
+    for i, l in ipairs(M.edits) do
+      if seen[l.file] and seen[l.file][l.row] then
+        if not M.opts.dedupe_column then
+          M.delete_location(l, i)
+        else
+          if seen[l.file] and seen[l.file][l.row] and seen[l.file][l.row][l.col] then
+            M.delete_location(l, i)
+          end
+        end
+      end
+
+      if not seen[l.file] then
+        seen[l.file] = {}
+      end
+
+      if not seen[l.file][l.row] then
+        seen[l.file][l.row] = {}
+      end
+
+      seen[l.file][l.row][l.col] = true
+    end
+  end
+
+
   -- todo: loop through the edits and set index so that dynamic_virt_text can actually work/enable fancy highlighting
 
   -- todo: should this happen async?
+  -- todo: when saving cache, we probably need to loop through the extmarks and update the location table with each
+  -- extmarks updated line/col, because they will auto update but our table will not.
   M.save_cache(M.edits)
+end
+
+-- pass this the location entry and the index its at in the edits table
+function M.delete_location(location, index)
+  local ns_id = vim.api.nvim_create_namespace("mre")
+  if location.bufnr then
+    vim.api.nvim_buf_del_extmark(location.bufnr, ns_id, location.id)
+  end
+  table.remove(M.edits, index)
 end
 
 function M.clear()
@@ -128,11 +195,11 @@ function M.clear()
   for _, bufnr in ipairs(vim.api.nvim_list_bufs()) do
     vim.api.nvim_buf_clear_namespace(bufnr, vim.api.nvim_create_namespace("mre"), 0, -1)
   end
+
+  M.save_cache(M.edits)
 end
 
 function M.jump_next()
-  -- print("jumping to next, cursor: " .. M.cursor)
-
   -- if cursor is out of bounds, wrap it around
   if M.cursor >= #M.edits then
     M.cursor = 0
@@ -143,8 +210,6 @@ function M.jump_next()
 end
 
 function M.jump_prev()
-  -- print("jumping to prev, cursor: " .. M.cursor)
-
   -- if cursor is out of bounds, wrap it around
   if M.cursor <= 1 then
     M.cursor = #M.edits + 1
@@ -156,7 +221,7 @@ end
 
 function M.jump_to(location)
   if location == nil then
-    print("no location to jump to, resetting cursor")
+    M.log("no location to jump to, resetting cursor")
 
     M.cursor = 1
 
@@ -170,6 +235,8 @@ function M.jump_to(location)
     if vim.api.nvim_buf_is_loaded(bufnr) == 0 then
       -- vim.api.nvim_command("e " .. location.file)
       M.open_or_edit(location.file)
+
+      M.debug("buffer isn't loaded")
 
       -- then update the buffer number
       bufnr = vim.api.nvim_get_current_buf()
@@ -187,22 +254,59 @@ function M.jump_to(location)
     local bufnr = vim.fn.bufadd(location.file)
     vim.fn.setbufvar(bufnr, "&buflisted", 1)
 
+    -- necessary?
     -- vim.api.nvim_command("e " .. location.file)
-    M.open_or_edit(location.file)
 
-    local success, new_location = pcall(M.create_extmark, location.file, bufnr, location.row, location.col,
+    local success, new_better_location = pcall(M.create_extmark, location.file, bufnr, location.row, location.col,
       location.virt_text, nil)
     if success then
-      location = new_location
+      location = new_better_location
       M.edits[M.cursor] = location
     else
       -- if we failed to create the extmark, we will just skip this entry.
+      M.debug("failed to create extmark for location")
       return
     end
+
+    -- todo: there is a bug where it looks like you're not jumping when multiple edits point to the same line, which is
+    -- possible when extmarks join into each other. could maybe detect that here and go to the next spot. Or
+    -- alternatively could have track_edit loop through all the marks and delete duplicates.
   end
 
+  -- todo: probably need to augment this to check more intelligently if the bufnr is infact pointing to the thing in
+  -- location.file. I've been experiencing situations where an edit is stored in a plugins buffer that isn't a file.
   vim.api.nvim_win_set_buf(0, location.bufnr)
-  vim.api.nvim_win_set_cursor(0, { location.row + 1, location.col })
+
+  -- get the extmark from location.id
+  local pos = M.get_position_from_entry(location)
+
+  if pos == nil then
+    -- should probably log something here huh
+    pos = { row = location.row, col = location.col }
+  end
+
+  M.log("jumping to: [" .. M.cursor .. "] " .. location.file .. " " .. pos.row .. " " .. pos.col)
+
+  vim.api.nvim_win_set_cursor(0, { pos.row, pos.col })
+end
+
+function M.get_position_from_entry(location)
+  local ns_id = vim.api.nvim_create_namespace("mre")
+  local success, extmark = pcall(vim.api.nvim_buf_get_extmark_by_id, location.bufnr, ns_id, location.id,
+    { details = true })
+  if success then
+    if extmark == {} or extmark == nil then
+      return
+    end
+
+    local row = extmark[1] + 1
+    local col = extmark[2]
+
+    return { row = row, col = col }
+  else
+    -- do nothing?
+    return
+  end
 end
 
 function M.cache_path()
@@ -235,12 +339,19 @@ end
 function M.serialize_cache(edits)
   local lines = {}
   for _, location in ipairs(edits) do
+    local pos = M.get_position_from_entry(location)
+    -- local pos = nil
+
+    if pos == nil then
+      pos = { row = location.row, col = location.col }
+    end
+
     local entry = string.format(
       "%s:%s:%s:%s:%s",
       location.file,
       location.bufnr,
-      location.row,
-      location.col,
+      pos.row,
+      pos.col,
       location.virt_text
     )
     table.insert(lines, entry)
@@ -302,7 +413,11 @@ M.defaults = {
   max_history_per_file = 30,
   max_history = 100,
   virt_text = "-",
-  dynamic_virt_text = false
+  dynamic_virt_text = false,
+  dedupe_line = true,
+  dedupe_column = false,
+  verbose = true,
+  debug = true,
 }
 
 function M.setup(opts)
@@ -319,7 +434,8 @@ function M.setup(opts)
     "gitrebase",
     "git",
     "qf",
-    "help"
+    "help",
+    "copilot"
   }
 
   vim.api.nvim_create_autocmd({ "TextChanged", "InsertEnter" }, {
@@ -328,6 +444,12 @@ function M.setup(opts)
       if vim.tbl_contains(ignore_filetypes, vim.bo.filetype) then
         return
       end
+
+      -- ignore if not modifiable, not buflisted or buftype is not empty
+      if vim.bo.modifiable == false or vim.bo.buflisted == 0 or vim.bo.buftype ~= "" then
+        return
+      end
+
       require('mre').track_edit(e.buf)
     end,
   })
